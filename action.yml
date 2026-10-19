@@ -119,8 +119,9 @@ runs:
         [[ -n "$SINCE" ]] && args+=(--since "$SINCE")
         [[ -n "$UNTIL" ]] && args+=(--until "$UNTIL")
         report="$RUNNER_TEMP/runsweep-report.md"
-        "$RUNSWEEP" "${args[@]}" > "$report"
-        code=$?
+        # shell: bash runs with -e; keep going on a non-zero exit to write the summary
+        code=0
+        "$RUNSWEEP" "${args[@]}" > "$report" || code=$?
         echo "exit-code=$code" >> "$GITHUB_OUTPUT"
         echo "report=$report" >> "$GITHUB_OUTPUT"
         # GitHub rejects a job summary over 1 MiB; keep room for the note.
