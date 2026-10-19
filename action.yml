@@ -1,0 +1,140 @@
+name: runsweep
+description: Find which GitHub Actions jobs a supply-chain incident touched and which secrets to rotate first.
+author: runsweep
+branding:
+  icon: filter
+  color: gray-dark
+
+inputs:
+  incident:
+    description: Built-in incident id (see `runsweep incidents`) or path to an incident YAML file in the workspace.
+    required: true
+  repos:
+    description: Repositories to scan, owner/name, separated by spaces or newlines. Defaults to the current repository unless `org` is set.
+    required: false
+    default: ''
+  org:
+    description: Scan every repository of this organization instead of `repos`.
+    required: false
+    default: ''
+  since:
+    description: Override the window start (RFC3339).
+    required: false
+    default: ''
+  until:
+    description: Override the window end (RFC3339).
+    required: false
+    default: ''
+  lookback:
+    description: Also check re-runs of runs created this long before the window (max 30d).
+    required: false
+    default: 7d
+  version:
+    description: runsweep release to run, without the leading v.
+    required: false
+    default: 0.5.0
+  token:
+    description: Token runsweep scans with. Needs read access to Actions, Contents and Metadata of the scanned repositories; scanning other repositories or an organization needs a token other than the default.
+    required: false
+    default: ${{ github.token }}
+  fail-on:
+    description: >-
+      When the step fails: `findings` (a job is AFFECTED or POSSIBLE), `unchecked` (findings, or not everything
+      could be checked) or `never`. A runsweep error (exit code 2) always fails the step.
+    required: false
+    default: findings
+
+outputs:
+  exit-code:
+    description: runsweep exit code. 0 nothing found and everything checked, 1 AFFECTED or POSSIBLE jobs, 2 error, 3 not everything checked.
+    value: ${{ steps.scan.outputs.exit-code }}
+  report:
+    description: Path to the full Markdown report.
+    value: ${{ steps.scan.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - id: install
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        VERSION: ${{ inputs.version }}
+        RUNNER_OS_NAME: ${{ runner.os }}
+        RUNNER_ARCH_NAME: ${{ runner.arch }}
+      run: |
+        set -euo pipefail
+        [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must look like 1.2.3, got: $VERSION"; exit 2; }
+        case "$RUNNER_OS_NAME" in
+          Linux) os=linux ext=tar.gz ;;
+          macOS) os=darwin ext=tar.gz ;;
+          Windows) os=windows ext=zip ;;
+          *) echo "::error::unsupported runner OS: $RUNNER_OS_NAME"; exit 2 ;;
+        esac
+        case "$RUNNER_ARCH_NAME" in
+          X64) arch=amd64 ;;
+          ARM64) arch=arm64 ;;
+          *) echo "::error::unsupported runner architecture: $RUNNER_ARCH_NAME"; exit 2 ;;
+        esac
+        asset="runsweep_${VERSION}_${os}_${arch}.${ext}"
+        dir="$RUNNER_TEMP/runsweep-$VERSION"
+        rm -rf "$dir" && mkdir -p "$dir" && cd "$dir"
+        gh release download "v$VERSION" -R runsweep/runsweep -p "$asset" -p checksums.txt
+        awk -v a="$asset" '$2 == a' checksums.txt > expected.txt
+        [[ -s expected.txt ]] || { echo "::error::$asset is not in checksums.txt"; exit 2; }
+        if command -v sha256sum > /dev/null; then sha256sum -c expected.txt; else shasum -a 256 -c expected.txt; fi
+        gh attestation verify "$asset" -R runsweep/runsweep \
+          --signer-workflow runsweep/runsweep/.github/workflows/release.yml \
+          --source-ref "refs/tags/v$VERSION" --deny-self-hosted-runners
+        if [[ "$ext" == zip ]]; then unzip -q "$asset"; else tar -xzf "$asset"; fi
+        bin="$dir/runsweep"; [[ "$os" == windows ]] && bin="$dir/runsweep.exe"
+        "$bin" --version
+        echo "bin=$bin" >> "$GITHUB_OUTPUT"
+
+    - id: scan
+      shell: bash
+      env:
+        RUNSWEEP: ${{ steps.install.outputs.bin }}
+        GITHUB_TOKEN: ${{ inputs.token }}
+        GH_TOKEN: ''
+        INCIDENT: ${{ inputs.incident }}
+        REPOS: ${{ inputs.repos }}
+        ORG: ${{ inputs.org }}
+        SINCE: ${{ inputs.since }}
+        UNTIL: ${{ inputs.until }}
+        LOOKBACK: ${{ inputs.lookback }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        CURRENT_REPO: ${{ github.repository }}
+      run: |
+        set -uo pipefail
+        case "$FAIL_ON" in findings|unchecked|never) ;; *) echo "::error::fail-on must be findings, unchecked or never, got: $FAIL_ON"; exit 2 ;; esac
+        args=(scan --format md --incident "$INCIDENT" --lookback "$LOOKBACK")
+        if [[ -n "$ORG" ]]; then
+          args+=(--org "$ORG")
+        else
+          read -r -d '' -a list <<< "${REPOS:-$CURRENT_REPO}" || true
+          (( ${#list[@]} )) || list=("$CURRENT_REPO")
+          for r in "${list[@]}"; do args+=(--repo "$r"); done
+        fi
+        [[ -n "$SINCE" ]] && args+=(--since "$SINCE")
+        [[ -n "$UNTIL" ]] && args+=(--until "$UNTIL")
+        report="$RUNNER_TEMP/runsweep-report.md"
+        "$RUNSWEEP" "${args[@]}" > "$report"
+        code=$?
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+        # GitHub rejects a job summary over 1 MiB; keep room for the note.
+        limit=1000000
+        if (( $(wc -c < "$report") <= limit )); then
+          cat "$report" >> "$GITHUB_STEP_SUMMARY"
+        else
+          # ponytail: byte cut at a line end; a cut inside a table or <details> renders the rest plainly
+          head -c "$limit" "$report" | sed '$d' >> "$GITHUB_STEP_SUMMARY"
+          printf '\n\n> [!WARNING]\n> **Report truncated.** The full report is at `%s`; upload it with actions/upload-artifact.\n' "$report" >> "$GITHUB_STEP_SUMMARY"
+        fi
+        case "$code" in
+          0) exit 0 ;;
+          1) [[ "$FAIL_ON" == never ]] && exit 0; exit 1 ;;
+          3) [[ "$FAIL_ON" == unchecked ]] && exit 3; exit 0 ;;
+          *) exit "$code" ;;
+        esac

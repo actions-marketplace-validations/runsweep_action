@@ -1,0 +1,43 @@
+name: ci
+on:
+  push: {branches: [main]}
+  pull_request:
+  schedule: [{cron: '29 4 * * 1'}]
+permissions: {contents: read}
+concurrency: {group: "ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}", cancel-in-progress: "${{ github.event_name == 'pull_request' }}"}
+jobs:
+  demo:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: {os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      # the drill pretends a package and an action SHA used by runsweep-demo were compromised
+      - id: run
+        uses: ./ # zizmor: ignore[self-repository] the test must run this checkout
+        with:
+          incident: .github/drill.yaml
+          repos: runsweep/runsweep-demo
+          fail-on: never
+      - shell: bash
+        env:
+          CODE: ${{ steps.run.outputs.exit-code }}
+          REPORT: ${{ steps.run.outputs.report }}
+        run: |
+          set -euo pipefail
+          [[ "$CODE" == 1 ]] || { echo "::error::expected exit code 1, got $CODE"; exit 1; }
+          grep -q '\[!CAUTION\]' "$REPORT"
+          grep -q 'Exposed' "$REPORT"
+  zizmor:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: {contents: read, security-events: write}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with: {version: v1.30.1}
